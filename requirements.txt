@@ -1,0 +1,5 @@
+PySide6>=6.4.0
+# numpy 锁在 1.x：大恒 gxipy 仍依赖 numpy.compat（numpy 2 已删除）
+numpy>=1.24.0,<2
+# opencv-python 4.11+ 硬性要求 numpy>=2，与大恒 SDK 冲突
+opencv-python>=4.8.0,<4.11
