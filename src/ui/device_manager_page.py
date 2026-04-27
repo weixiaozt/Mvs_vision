@@ -1,22 +1,27 @@
 """
-设备管理页 — 扫描相机 + 连接/断开 + 参数调试
+设备管理页 — 扫描相机 + 连接/断开 + 相机参数调试 + 电机控制
 
 布局（垂直滚动）：
-  ┌─ 设备列表 ─────────────────────────────┐
+  ┌─ 相机：设备列表 ─────────────────────────┐
   │ [🔍 扫描] [🔌 连接] [⏏ 断开]              │
   │ 表格：厂商 | 型号 | IP/SN | 状态           │
   └────────────────────────────────────────┘
   ┌─ 相机参数（连接后启用）─────────────────┐
   │ 曝光 / 增益 / 帧率(面阵)或行频(线阵) /     │
   │ 触发 / ROI                                │
-  │ [💾 应用参数] [🔄 读取参数] [🔧 恢复默认]  │
+  └────────────────────────────────────────┘
+  ┌─ 电机控制（汇川 SV630P）───────────────────┐
+  │ 串口 / 波特率 / 站号 → 连接 / 断开            │
+  │ 段1速度 / VDI 控制字 → 写入 / 读取            │
+  │ 触发位置1/位置2 / 复位 / 到位状态显示          │
   └────────────────────────────────────────┘
 """
+import serial.tools.list_ports
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
     QScrollArea, QGridLayout, QSlider, QSpinBox, QDoubleSpinBox,
-    QComboBox, QCheckBox, QMessageBox,
+    QComboBox, QCheckBox, QMessageBox, QLineEdit,
 )
 from PySide6.QtCore import Qt, Signal
 
@@ -97,10 +102,12 @@ class ParamRow(QWidget):
 
 
 class DeviceManagerPage(QWidget):
-    """扫描 + 连接 + 参数调试 三合一"""
+    """相机扫描+连接+调参 + 电机控制 一站式管理"""
 
     camera_connected = Signal(object)
     camera_disconnected = Signal(object)
+    motor_connected = Signal(object)
+    motor_disconnected = Signal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -109,10 +116,18 @@ class DeviceManagerPage(QWidget):
         self._active_backend = None
         self._scan_results = []
         self._rate_param_name = _FPS_PARAM
+        self._motor = None    # InovanceServo 实例由外部注入
         self._setup_ui()
 
     def set_backends(self, backends: dict):
         self._backends = backends
+
+    def set_motor(self, motor):
+        """注入电机实例（servo_motor.InovanceServo）"""
+        self._motor = motor
+        if motor is not None:
+            motor.connected_changed.connect(self._on_motor_connected)
+            motor.status_changed.connect(self._on_motor_status)
 
     def set_active_backend(self, backend):
         """外部（自动连接成功后）同步活动相机"""
@@ -280,10 +295,300 @@ class DeviceManagerPage(QWidget):
 
         self._set_param_enabled(False)
         layout.addWidget(self.param_card)
+
+        # ---------- 电机控制卡片 ----------
+        layout.addWidget(self._build_motor_card())
         layout.addStretch()
 
         scroll.setWidget(content)
         root.addWidget(scroll, 1)
+
+    def _build_motor_card(self) -> QWidget:
+        card = QWidget()
+        card.setStyleSheet("background-color: #1e293b; border-radius: 8px;")
+        ml = QVBoxLayout(card)
+        ml.setContentsMargins(16, 16, 16, 16)
+        ml.setSpacing(14)
+
+        ml.addWidget(self._section("⚙ 电机控制（汇川 SV630P）"))
+
+        # ----- 通讯参数 -----
+        comm = QGridLayout()
+        comm.setSpacing(10)
+
+        comm.addWidget(self._label("串口"), 0, 0)
+        self.combo_motor_port = QComboBox()
+        self.combo_motor_port.setEditable(True)
+        self.combo_motor_port.setFixedWidth(120)
+        self._refresh_serial_ports()
+        # 默认 COM3
+        idx = self.combo_motor_port.findText("COM3")
+        if idx >= 0:
+            self.combo_motor_port.setCurrentIndex(idx)
+        else:
+            self.combo_motor_port.setCurrentText("COM3")
+        comm.addWidget(self.combo_motor_port, 0, 1)
+
+        btn_refresh_port = QPushButton("🔄")
+        btn_refresh_port.setObjectName("PrimaryBtn")
+        btn_refresh_port.setFixedWidth(40)
+        btn_refresh_port.setToolTip("刷新串口列表")
+        btn_refresh_port.clicked.connect(self._refresh_serial_ports)
+        comm.addWidget(btn_refresh_port, 0, 2)
+
+        comm.addWidget(self._label("波特率"), 0, 3)
+        self.combo_motor_baud = QComboBox()
+        self.combo_motor_baud.addItems(["9600", "19200", "38400", "57600", "115200"])
+        self.combo_motor_baud.setCurrentText("115200")
+        self.combo_motor_baud.setFixedWidth(100)
+        comm.addWidget(self.combo_motor_baud, 0, 4)
+
+        comm.addWidget(self._label("站号"), 0, 5)
+        self.spin_motor_station = QSpinBox()
+        self.spin_motor_station.setRange(1, 247)
+        self.spin_motor_station.setValue(1)
+        self.spin_motor_station.setFixedWidth(60)
+        self.spin_motor_station.setStyleSheet(
+            "QSpinBox { background-color: #0f172a; color: #e2e8f0; "
+            "border: 1px solid #334155; padding: 4px 8px; border-radius: 4px; }"
+        )
+        comm.addWidget(self.spin_motor_station, 0, 6)
+        ml.addLayout(comm)
+
+        # ----- 连接按钮 -----
+        conn_row = QHBoxLayout()
+        conn_row.setSpacing(10)
+        self.btn_motor_connect = QPushButton("🔌 连接电机")
+        self.btn_motor_connect.setObjectName("SuccessBtn")
+        self.btn_motor_connect.setCursor(Qt.PointingHandCursor)
+        self.btn_motor_connect.clicked.connect(self._motor_connect)
+        conn_row.addWidget(self.btn_motor_connect)
+
+        self.btn_motor_disconnect = QPushButton("⏏ 断开电机")
+        self.btn_motor_disconnect.setObjectName("DangerBtn")
+        self.btn_motor_disconnect.setCursor(Qt.PointingHandCursor)
+        self.btn_motor_disconnect.setEnabled(False)
+        self.btn_motor_disconnect.clicked.connect(self._motor_disconnect)
+        conn_row.addWidget(self.btn_motor_disconnect)
+        conn_row.addStretch()
+
+        self.lbl_motor_status = QLabel("● 未连接")
+        self.lbl_motor_status.setStyleSheet("color: #ef4444; font-size: 12px;")
+        conn_row.addWidget(self.lbl_motor_status)
+        ml.addLayout(conn_row)
+
+        # ----- 段1速度 -----
+        speed_row = QHBoxLayout()
+        speed_row.setSpacing(10)
+        lbl = QLabel("段 1 速度")
+        lbl.setObjectName("ParamLabel")
+        lbl.setFixedWidth(90)
+        speed_row.addWidget(lbl)
+        self.spin_motor_speed = QSpinBox()
+        self.spin_motor_speed.setRange(1, 6000)
+        self.spin_motor_speed.setValue(10)
+        self.spin_motor_speed.setFixedWidth(80)
+        self.spin_motor_speed.setStyleSheet(
+            "QSpinBox { background-color: #0f172a; color: #e2e8f0; "
+            "border: 1px solid #334155; padding: 4px 8px; border-radius: 4px; }"
+        )
+        speed_row.addWidget(self.spin_motor_speed)
+        unit = QLabel("rpm")
+        unit.setObjectName("ParamLabel")
+        speed_row.addWidget(unit)
+        speed_row.addStretch()
+
+        self.btn_motor_speed_write = QPushButton("写入")
+        self.btn_motor_speed_write.setObjectName("PrimaryBtn")
+        self.btn_motor_speed_write.setFixedWidth(70)
+        self.btn_motor_speed_write.clicked.connect(self._motor_write_speed)
+        speed_row.addWidget(self.btn_motor_speed_write)
+
+        self.btn_motor_speed_read = QPushButton("读取")
+        self.btn_motor_speed_read.setObjectName("PrimaryBtn")
+        self.btn_motor_speed_read.setFixedWidth(70)
+        self.btn_motor_speed_read.clicked.connect(self._motor_read_speed)
+        speed_row.addWidget(self.btn_motor_speed_read)
+        ml.addLayout(speed_row)
+
+        # ----- 通用寄存器读写 -----
+        reg_row = QHBoxLayout()
+        reg_row.setSpacing(10)
+        lbl_reg = QLabel("寄存器")
+        lbl_reg.setObjectName("ParamLabel")
+        lbl_reg.setFixedWidth(90)
+        reg_row.addWidget(lbl_reg)
+
+        self.edit_motor_addr = QLineEdit()
+        self.edit_motor_addr.setPlaceholderText("0x3100")
+        self.edit_motor_addr.setText("0x3100")
+        self.edit_motor_addr.setFixedWidth(90)
+        self.edit_motor_addr.setStyleSheet(
+            "QLineEdit { background-color: #0f172a; color: #e2e8f0; "
+            "border: 1px solid #334155; padding: 4px 8px; border-radius: 4px; }"
+        )
+        reg_row.addWidget(self.edit_motor_addr)
+        reg_row.addWidget(QLabel("值"))
+
+        self.spin_motor_value = QSpinBox()
+        self.spin_motor_value.setRange(0, 65535)
+        self.spin_motor_value.setValue(1)
+        self.spin_motor_value.setFixedWidth(80)
+        self.spin_motor_value.setStyleSheet(
+            "QSpinBox { background-color: #0f172a; color: #e2e8f0; "
+            "border: 1px solid #334155; padding: 4px 8px; border-radius: 4px; }"
+        )
+        reg_row.addWidget(self.spin_motor_value)
+
+        btn_reg_write = QPushButton("写")
+        btn_reg_write.setObjectName("PrimaryBtn")
+        btn_reg_write.setFixedWidth(50)
+        btn_reg_write.clicked.connect(self._motor_write_reg)
+        reg_row.addWidget(btn_reg_write)
+
+        btn_reg_read = QPushButton("读")
+        btn_reg_read.setObjectName("PrimaryBtn")
+        btn_reg_read.setFixedWidth(50)
+        btn_reg_read.clicked.connect(self._motor_read_reg)
+        reg_row.addWidget(btn_reg_read)
+        reg_row.addStretch()
+        ml.addLayout(reg_row)
+
+        # ----- 触发动作 -----
+        action_row = QHBoxLayout()
+        action_row.setSpacing(10)
+
+        self.btn_motor_pos1 = QPushButton("▶ 触发位置 1")
+        self.btn_motor_pos1.setObjectName("SuccessBtn")
+        self.btn_motor_pos1.clicked.connect(lambda: self._motor_trigger(1))
+        action_row.addWidget(self.btn_motor_pos1)
+
+        self.btn_motor_pos2 = QPushButton("▶ 触发位置 2")
+        self.btn_motor_pos2.setObjectName("SuccessBtn")
+        self.btn_motor_pos2.clicked.connect(lambda: self._motor_trigger(2))
+        action_row.addWidget(self.btn_motor_pos2)
+
+        self.btn_motor_reset = QPushButton("⏹ 复位")
+        self.btn_motor_reset.setObjectName("DangerBtn")
+        self.btn_motor_reset.clicked.connect(self._motor_reset)
+        action_row.addWidget(self.btn_motor_reset)
+
+        action_row.addStretch()
+
+        self.lbl_motor_inpos = QLabel("到位状态：—")
+        self.lbl_motor_inpos.setStyleSheet("color: #94a3b8; font-size: 12px;")
+        action_row.addWidget(self.lbl_motor_inpos)
+        ml.addLayout(action_row)
+
+        # 默认禁用（电机未连接）
+        self._set_motor_actions_enabled(False)
+        return card
+
+    def _refresh_serial_ports(self):
+        current = self.combo_motor_port.currentText() if hasattr(self, "combo_motor_port") else ""
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+        self.combo_motor_port.clear()
+        self.combo_motor_port.addItems(ports if ports else [])
+        if current and current in ports:
+            self.combo_motor_port.setCurrentText(current)
+
+    def _set_motor_actions_enabled(self, enabled: bool):
+        for w in (
+            self.btn_motor_speed_write, self.btn_motor_speed_read,
+            self.btn_motor_pos1, self.btn_motor_pos2, self.btn_motor_reset,
+        ):
+            w.setEnabled(enabled)
+
+    # ==================== 电机事件 / 操作 ====================
+    def _motor_connect(self):
+        if self._motor is None:
+            QMessageBox.warning(self, "未注入电机实例", "InovanceServo 实例未注入到设备管理页")
+            return
+        port = self.combo_motor_port.currentText().strip()
+        baud = int(self.combo_motor_baud.currentText())
+        station = self.spin_motor_station.value()
+        if self._motor.connect(port, baud, station):
+            self.btn_motor_connect.setEnabled(False)
+            self.btn_motor_disconnect.setEnabled(True)
+            self._set_motor_actions_enabled(True)
+            self.motor_connected.emit(self._motor)
+
+    def _motor_disconnect(self):
+        if self._motor is None:
+            return
+        self._motor.disconnect()
+        self.btn_motor_connect.setEnabled(True)
+        self.btn_motor_disconnect.setEnabled(False)
+        self._set_motor_actions_enabled(False)
+        self.motor_disconnected.emit(self._motor)
+
+    def _on_motor_connected(self, connected):
+        if connected:
+            self.lbl_motor_status.setText("● 已连接")
+            self.lbl_motor_status.setStyleSheet("color: #10b981; font-size: 12px;")
+        else:
+            self.lbl_motor_status.setText("● 未连接")
+            self.lbl_motor_status.setStyleSheet("color: #ef4444; font-size: 12px;")
+            self.lbl_motor_inpos.setText("到位状态：—")
+
+    def _on_motor_status(self, status: dict):
+        in_pos = status.get("in_position", False)
+        if in_pos:
+            self.lbl_motor_inpos.setText("到位状态：● 已到位")
+            self.lbl_motor_inpos.setStyleSheet("color: #10b981; font-size: 12px;")
+        else:
+            self.lbl_motor_inpos.setText("到位状态：○ 运动中")
+            self.lbl_motor_inpos.setStyleSheet("color: #f59e0b; font-size: 12px;")
+
+    def _motor_trigger(self, n: int):
+        if self._motor is None or not self._motor.is_connected():
+            return
+        self._motor.trigger_position(n)
+
+    def _motor_reset(self):
+        if self._motor is None or not self._motor.is_connected():
+            return
+        self._motor.reset()
+
+    def _motor_write_speed(self):
+        if self._motor is None or not self._motor.is_connected():
+            return
+        self._motor.set_segment_speed(self.spin_motor_speed.value())
+
+    def _motor_read_speed(self):
+        if self._motor is None or not self._motor.is_connected():
+            return
+        v = self._motor.get_segment_speed()
+        if v is not None:
+            self.spin_motor_speed.setValue(int(v))
+
+    def _parse_addr(self, text: str) -> int | None:
+        text = text.strip()
+        try:
+            if text.lower().startswith("0x"):
+                return int(text, 16)
+            return int(text)
+        except Exception:
+            QMessageBox.warning(self, "格式错误", f"寄存器地址格式不对: {text}")
+            return None
+
+    def _motor_write_reg(self):
+        if self._motor is None or not self._motor.is_connected():
+            return
+        addr = self._parse_addr(self.edit_motor_addr.text())
+        if addr is None:
+            return
+        self._motor.write_register(addr, self.spin_motor_value.value())
+
+    def _motor_read_reg(self):
+        if self._motor is None or not self._motor.is_connected():
+            return
+        addr = self._parse_addr(self.edit_motor_addr.text())
+        if addr is None:
+            return
+        v = self._motor.read_register(addr)
+        if v is not None:
+            self.spin_motor_value.setValue(int(v))
 
     def _section(self, text):
         lbl = QLabel(text)

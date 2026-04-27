@@ -43,6 +43,7 @@ class Sidebar(QWidget):
     MENU = [
         ("preview",  "📹 实时预览"),
         ("device",   "🔧 设备管理"),
+        ("offline",  "🧪 离线测试"),
         ("process",  "🎨 图像处理"),
         ("detect",   "🎯 缺陷检测"),
         ("measure",  "📏 尺寸测量"),

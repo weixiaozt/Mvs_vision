@@ -28,10 +28,12 @@ from .sidebar import Sidebar
 from .camera_view import CameraView
 from .control_panel import ControlPanel
 from .device_manager_page import DeviceManagerPage
+from .offline_test_page import OfflineTestPage
 
 from ..core.hik_camera import HikCamera
 from ..core.daheng_camera import DahengCamera
 from ..core.vision_engine import VisionEngine
+from ..core.servo_motor import InovanceServo
 
 
 # ============================================================
@@ -102,7 +104,8 @@ class MainWindow(QMainWindow):
     _PAGE_INDEX = {
         "preview": 0,
         "device": 1,
-        "process": 2, "detect": 2, "measure": 2, "record": 2, "settings": 2,
+        "offline": 2,
+        "process": 3, "detect": 3, "measure": 3, "record": 3, "settings": 3,
     }
 
     def __init__(self):
@@ -123,6 +126,10 @@ class MainWindow(QMainWindow):
             backend.log_message.connect(self._on_camera_log)
             backend.connected_changed.connect(self._on_camera_connected)
         self.cam = self._cam_backends["daheng"]
+
+        # 电机（汇川 SV630P）
+        self.motor = InovanceServo(self)
+        self.motor.log_message.connect(self._on_camera_log)  # 复用日志通道
 
         # ---- UI 骨架 ----
         central = QWidget()
@@ -167,14 +174,21 @@ class MainWindow(QMainWindow):
         self.camera_view.detection_result.connect(self.control_panel.on_detection)
         self.stack.addWidget(self.preview_page)
 
-        # 页面 1：设备管理（扫描+连接+调参）
+        # 页面 1：设备管理（扫描+连接+调参 + 电机）
         self.device_page = DeviceManagerPage()
         self.device_page.set_backends(self._cam_backends)
+        self.device_page.set_motor(self.motor)
         self.device_page.camera_connected.connect(self._on_device_connected)
         self.device_page.camera_disconnected.connect(self._on_device_disconnected)
         self.stack.addWidget(self.device_page)
 
-        # 页面 2：占位
+        # 页面 2：离线测试（运动 + 拍照联动）
+        self.offline_page = OfflineTestPage()
+        self.offline_page.set_motor(self.motor)
+        self.offline_page.snap_request.connect(self._on_offline_snap_request)
+        self.stack.addWidget(self.offline_page)
+
+        # 页面 3：占位
         self.placeholder_page = QWidget()
         ph_layout = QVBoxLayout(self.placeholder_page)
         ph_layout.setAlignment(Qt.AlignCenter)
@@ -344,7 +358,7 @@ class MainWindow(QMainWindow):
             if self.cam is not None and self.cam.is_connected():
                 self.device_page.set_active_backend(self.cam)
         page_label = {
-            "preview": "实时预览", "device": "设备管理",
+            "preview": "实时预览", "device": "设备管理", "offline": "离线测试",
             "process": "图像处理", "detect": "缺陷检测",
             "measure": "尺寸测量", "record": "数据记录",
             "settings": "系统设置",
@@ -376,8 +390,22 @@ class MainWindow(QMainWindow):
         self.control_panel.reset_count()
         self.log_panel.append_log("操作", "计数器已重置", "warning")
 
+    # ==================== 离线测试拍照请求 ====================
+    def _on_offline_snap_request(self, idx: int):
+        """离线测试 worker 在运动过程中请求拍照
+        相机端的具体软触发实现 等用户告知后再接；当前先记日志占位"""
+        if self.cam is None or not self.cam.is_connected():
+            return
+        # TODO: 等用户给具体软触发接口（HikCamera/DahengCamera 的 trigger_software 方法），
+        #       这里调用 self.cam.trigger_software() 并把帧存到指定目录
+        # 先简单记录日志，方便用户在拿到完整流程时看到拍照请求确实被触发
+        if idx == 1 or idx % 100 == 0:
+            self.log_panel.append_log("离线测试", f"拍照请求 #{idx}（相机接口待接入）", "info")
+
     # ==================== 退出 ====================
     def closeEvent(self, event):
+        if self.motor and self.motor.is_connected():
+            self.motor.disconnect()
         for backend in self._cam_backends.values():
             if backend and backend.is_connected():
                 backend.disconnect_device()
