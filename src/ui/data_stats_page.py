@@ -12,7 +12,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QPainter, QColor, QPen, QBrush
 
 # 复用原 control_panel 里的卡片 / 趋势图 / 缺陷 badge 组件
-from .control_panel import StatCard, MiniChart, DefectBadge
+from .stat_widgets import StatCard, MiniChart, DefectBadge
 
 
 class DataStatsPage(QWidget):
