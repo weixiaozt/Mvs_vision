@@ -1,18 +1,21 @@
 """
-主窗口（v1 风格两栏布局）
+主窗口 — 两栏布局 + 扁平 7 项侧边栏
+
 ┌─ 顶部栏（标题 + 开始/停止/重置 + 状态） ─────────────┐
 ├──────────┬──────────────────────────────────────────┤
-│  侧边栏   │  右侧（stack 切换 + 底部状态栏）            │
-│ 二级菜单  │  ┌─ stack ──────────────────┐            │
-│          │  │ preview_page (预览+ControlPanel)         │
-│          │  │ debug_page                              │
-│          │  │ placeholder                             │
-│          │  └─────────────────────────┘                │
-│          │  ┌─ 底部（连接灯 + 日志）──┐                │
-│          │  └─────────────────────┘                  │
+│ 侧边栏    │ 右侧（stack 切换 + 底部状态栏）           │
+│ 实时预览  │  ┌─ stack ──────────────────────────┐   │
+│ 设备管理  │  │ 0. preview_page  = CameraView + ControlPanel │
+│ 图像处理  │  │ 1. device_manager_page                       │
+│ 缺陷检测  │  │ 2. placeholder_page                          │
+│ 尺寸测量  │  └────────────────────────────────────┘  │
+│ 数据记录  │  ┌─ 底部（连接灯 + 日志）─────────────┐  │
+│ 系统设置  │  └────────────────────────────────────┘  │
 └──────────┴──────────────────────────────────────────┘
 
-UI 完全 v1 风格；core 层保留 v2 的多厂商 backend 字典 + connect_by_serial / is_line_scan。
+默认进入实时预览页。
+设备管理页负责扫描/连接/调参，独立于实时预览。
+启动后仍按 v1 模式自动连接第一个发现的相机（用户可在设备管理页手动断开/重连）。
 """
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel, QPushButton,
@@ -24,7 +27,7 @@ from .styles import MAIN_STYLE
 from .sidebar import Sidebar
 from .camera_view import CameraView
 from .control_panel import ControlPanel
-from .camera_debug import CameraDebugPanel
+from .device_manager_page import DeviceManagerPage
 
 from ..core.hik_camera import HikCamera
 from ..core.daheng_camera import DahengCamera
@@ -37,7 +40,6 @@ from ..core.vision_engine import VisionEngine
 class StatusLight(QWidget):
     def __init__(self, name, connected=False, parent=None):
         super().__init__(parent)
-        self.name = name
         self._connected = connected
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -96,6 +98,13 @@ class LogPanel(QTextEdit):
 # 主窗口
 # ============================================================
 class MainWindow(QMainWindow):
+    # 侧边栏 key → stack 索引
+    _PAGE_INDEX = {
+        "preview": 0,
+        "device": 1,
+        "process": 2, "detect": 2, "measure": 2, "record": 2, "settings": 2,
+    }
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("MVS Vision - 工业视觉检测系统")
@@ -106,7 +115,6 @@ class MainWindow(QMainWindow):
         # ---- 核心模块 ----
         self.vision_engine = VisionEngine()
 
-        # 多厂商 backend：自动连接时按顺序枚举（大恒优先），第一个发现就用
         self._cam_backends = {
             "daheng": DahengCamera(self),
             "hik": HikCamera(self),
@@ -114,7 +122,7 @@ class MainWindow(QMainWindow):
         for backend in self._cam_backends.values():
             backend.log_message.connect(self._on_camera_log)
             backend.connected_changed.connect(self._on_camera_connected)
-        self.cam = self._cam_backends["daheng"]   # 占位活动 backend
+        self.cam = self._cam_backends["daheng"]
 
         # ---- UI 骨架 ----
         central = QWidget()
@@ -125,18 +133,15 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(self._create_top_bar())
 
-        # 中间内容
         mid = QWidget()
         mid_layout = QHBoxLayout(mid)
         mid_layout.setContentsMargins(0, 0, 0, 0)
         mid_layout.setSpacing(0)
 
-        # 侧边栏
         self.sidebar = Sidebar()
         self.sidebar.nav_changed.connect(self._on_nav)
         mid_layout.addWidget(self.sidebar)
 
-        # 右侧
         right = QWidget()
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(16, 16, 16, 16)
@@ -144,7 +149,7 @@ class MainWindow(QMainWindow):
 
         self.stack = QStackedWidget()
 
-        # 页面 0：实时预览 = camera_view + control_panel 横向并排
+        # 页面 0：实时预览 = CameraView + ControlPanel
         self.preview_page = QWidget()
         preview_layout = QHBoxLayout(self.preview_page)
         preview_layout.setContentsMargins(0, 0, 0, 0)
@@ -162,10 +167,12 @@ class MainWindow(QMainWindow):
         self.camera_view.detection_result.connect(self.control_panel.on_detection)
         self.stack.addWidget(self.preview_page)
 
-        # 页面 1：相机调试
-        self.debug_page = CameraDebugPanel()
-        self.debug_page.set_camera(self.cam)
-        self.stack.addWidget(self.debug_page)
+        # 页面 1：设备管理（扫描+连接+调参）
+        self.device_page = DeviceManagerPage()
+        self.device_page.set_backends(self._cam_backends)
+        self.device_page.camera_connected.connect(self._on_device_connected)
+        self.device_page.camera_disconnected.connect(self._on_device_disconnected)
+        self.stack.addWidget(self.device_page)
 
         # 页面 2：占位
         self.placeholder_page = QWidget()
@@ -179,13 +186,16 @@ class MainWindow(QMainWindow):
         ph_layout.addWidget(ph_text, alignment=Qt.AlignCenter)
         self.stack.addWidget(self.placeholder_page)
 
+        # 默认进入实时预览
+        self.stack.setCurrentIndex(0)
+
         right_layout.addWidget(self.stack, 1)
         right_layout.addWidget(self._create_bottom_bar())
 
         mid_layout.addWidget(right, 1)
         main_layout.addWidget(mid, 1)
 
-        # 启动后尝试自动连接相机
+        # 启动后尝试自动连接相机（保持 v1 行为：枚举到就连第一台）
         QTimer.singleShot(500, self._auto_connect_camera)
 
     # ==================== 顶部栏 ====================
@@ -227,7 +237,6 @@ class MainWindow(QMainWindow):
         self.sys_status = QLabel("🟢 系统就绪")
         self.sys_status.setObjectName("TopBarStatus")
         layout.addWidget(self.sys_status)
-
         return bar
 
     # ==================== 底部栏 ====================
@@ -239,7 +248,6 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(16, 10, 16, 10)
         layout.setSpacing(16)
 
-        # 左：连接状态
         left = QWidget()
         left.setStyleSheet("background-color: #0f172a; border-radius: 8px; border: 1px solid #1e293b;")
         ll = QVBoxLayout(left)
@@ -260,7 +268,6 @@ class MainWindow(QMainWindow):
         ll.addLayout(lights)
         layout.addWidget(left, 0)
 
-        # 右：日志
         right = QWidget()
         right.setStyleSheet("background-color: #0f172a; border-radius: 8px; border: 1px solid #1e293b;")
         rl = QVBoxLayout(right)
@@ -276,7 +283,6 @@ class MainWindow(QMainWindow):
 
     # ==================== 自动连接 ====================
     def _auto_connect_camera(self):
-        """启动后按顺序枚举：大恒 → 海康，第一个发现的就连接"""
         for name, backend in self._cam_backends.items():
             devices = backend.enum_devices()
             if not devices:
@@ -294,15 +300,18 @@ class MainWindow(QMainWindow):
                     "color: #00d4ff; font-size: 11px; padding: 2px 10px; "
                     "background-color: #0f172a; border-radius: 4px;"
                 )
+                # 同步给设备管理页
+                self.device_page.set_active_backend(backend)
                 return
-        self.log_panel.append_log("相机", "未检测到相机，请连接设备后重启或使用相机调试页", "warning")
+        self.log_panel.append_log(
+            "相机", "未检测到相机，请到「设备管理」中扫描或连接设备后重启", "warning"
+        )
 
     def _switch_active_backend(self, backend):
         if self.cam is backend:
             return
         self.cam = backend
         self.camera_view.set_camera(backend)
-        self.debug_page.set_camera(backend)
 
     def _on_camera_log(self, tag, msg, level):
         self.log_panel.append_log(tag, msg, level or "info")
@@ -310,33 +319,42 @@ class MainWindow(QMainWindow):
     def _on_camera_connected(self, connected):
         self.light_camera.set_connected(connected)
 
+    # 设备管理页发出的连接/断开
+    def _on_device_connected(self, backend):
+        self._switch_active_backend(backend)
+        self.light_camera.set_connected(True)
+        self.sys_status.setText("🔵 相机已连接")
+        self.sys_status.setStyleSheet(
+            "color: #00d4ff; font-size: 11px; padding: 2px 10px; "
+            "background-color: #0f172a; border-radius: 4px;"
+        )
+
+    def _on_device_disconnected(self, backend):
+        self.light_camera.set_connected(False)
+        self.sys_status.setText("🟢 系统就绪")
+        self.sys_status.setStyleSheet("")
+
     # ==================== 侧边栏切换 ====================
     def _on_nav(self, key: str):
-        page_names = {
-            "camera_preview": "实时预览",
-            "camera_debug": "相机调试",
-            "camera": "相机采集",
-            "process": "图像处理",
-            "detect": "缺陷检测",
-            "measure": "尺寸测量",
-            "record": "数据记录",
+        idx = self._PAGE_INDEX.get(key, 0)
+        self.stack.setCurrentIndex(idx)
+        # 切到设备管理时刷新参数
+        if key == "device" and self.device_page._active_backend is None:
+            # 如果有活动 backend 但没同步过，补一下
+            if self.cam is not None and self.cam.is_connected():
+                self.device_page.set_active_backend(self.cam)
+        page_label = {
+            "preview": "实时预览", "device": "设备管理",
+            "process": "图像处理", "detect": "缺陷检测",
+            "measure": "尺寸测量", "record": "数据记录",
             "settings": "系统设置",
-        }
-        name = page_names.get(key, key)
-        self.log_panel.append_log("导航", f"切换到页面: {name}", "info")
-
-        if key == "camera_preview":
-            self.stack.setCurrentIndex(0)
-        elif key == "camera_debug":
-            self.stack.setCurrentIndex(1)
-            self.debug_page.refresh_params()
-        elif key in ("process", "detect", "measure", "record", "settings"):
-            self.stack.setCurrentIndex(2)
+        }.get(key, key)
+        self.log_panel.append_log("导航", f"切换到：{page_label}", "info")
 
     # ==================== 顶部按钮 ====================
     def _on_start(self):
         if not self.cam.is_connected():
-            self.log_panel.append_log("运行", "相机未连接", "warning")
+            self.log_panel.append_log("运行", "相机未连接，请到「设备管理」连接相机", "warning")
             return
         if not self.cam.is_grabbing():
             self.cam.start_grabbing()

@@ -303,6 +303,16 @@ QCheckBox::indicator:checked {
     border-color: #0891b2;
 }
 
+/* ==================== 滚动区域（防白底）==================== */
+QScrollArea {
+    background-color: #111827;
+    border: none;
+}
+
+QScrollArea > QWidget > QWidget {
+    background-color: #111827;
+}
+
 /* ==================== 进度条 ==================== */
 QProgressBar {
     background-color: #1e293b;
