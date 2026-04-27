@@ -1,19 +1,30 @@
+"""
+主窗口（v1 风格两栏布局）
+┌─ 顶部栏（标题 + 开始/停止/重置 + 状态） ─────────────┐
+├──────────┬──────────────────────────────────────────┤
+│  侧边栏   │  右侧（stack 切换 + 底部状态栏）            │
+│ 二级菜单  │  ┌─ stack ──────────────────┐            │
+│          │  │ preview_page (预览+ControlPanel)         │
+│          │  │ debug_page                              │
+│          │  │ placeholder                             │
+│          │  └─────────────────────────┘                │
+│          │  ┌─ 底部（连接灯 + 日志）──┐                │
+│          │  └─────────────────────┘                  │
+└──────────┴──────────────────────────────────────────┘
+
+UI 完全 v1 风格；core 层保留 v2 的多厂商 backend 字典 + connect_by_serial / is_line_scan。
+"""
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel, QPushButton,
-    QTextEdit, QStackedWidget, QSplitter,
+    QTextEdit, QStackedWidget,
 )
-from PySide6.QtCore import Qt, QTimer, QSettings
+from PySide6.QtCore import Qt, QTimer
 
 from .styles import MAIN_STYLE
 from .sidebar import Sidebar
 from .camera_view import CameraView
-from .data_stats_page import DataStatsPage
-from .param_settings_page import ParamSettingsPage
-from .device_manager_page import DeviceManagerPage
-from .offline_test_page import OfflineTestPage
-from .image_viewer_page import ImageViewerPage
-from .advanced_stats_page import AdvancedStatsPage
-from .system_settings_page import SystemSettingsPage
+from .control_panel import ControlPanel
+from .camera_debug import CameraDebugPanel
 
 from ..core.hik_camera import HikCamera
 from ..core.daheng_camera import DahengCamera
@@ -21,7 +32,7 @@ from ..core.vision_engine import VisionEngine
 
 
 # ============================================================
-# 底部状态灯 + 日志
+# 底部辅助控件
 # ============================================================
 class StatusLight(QWidget):
     def __init__(self, name, connected=False, parent=None):
@@ -67,12 +78,7 @@ class LogPanel(QTextEdit):
         """)
 
     def append_log(self, tag, message, level="info"):
-        colors = {
-            "info": "#94a3b8",
-            "success": "#10b981",
-            "warning": "#f59e0b",
-            "error": "#ef4444",
-        }
+        colors = {"info": "#94a3b8", "success": "#10b981", "warning": "#f59e0b", "error": "#ef4444"}
         color = colors.get(level, "#94a3b8")
         import datetime
         ts = datetime.datetime.now().strftime("%H:%M:%S")
@@ -94,14 +100,13 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("MVS Vision - 工业视觉检测系统")
         self.setMinimumSize(1500, 950)
-        self.resize(1760, 1050)
+        self.resize(1680, 1050)
         self.setStyleSheet(MAIN_STYLE)
 
-        self._settings = QSettings("MVSVision", "MVSVision")
-
-        # ========== 核心模块 ==========
+        # ---- 核心模块 ----
         self.vision_engine = VisionEngine()
 
+        # 多厂商 backend：自动连接时按顺序枚举（大恒优先），第一个发现就用
         self._cam_backends = {
             "daheng": DahengCamera(self),
             "hik": HikCamera(self),
@@ -111,103 +116,77 @@ class MainWindow(QMainWindow):
             backend.connected_changed.connect(self._on_camera_connected)
         self.cam = self._cam_backends["daheng"]   # 占位活动 backend
 
-        # ========== UI 骨架 ==========
+        # ---- UI 骨架 ----
         central = QWidget()
         self.setCentralWidget(central)
-        root = QVBoxLayout(central)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
+        main_layout = QVBoxLayout(central)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
 
-        root.addWidget(self._create_top_bar())
+        main_layout.addWidget(self._create_top_bar())
 
+        # 中间内容
         mid = QWidget()
         mid_layout = QHBoxLayout(mid)
         mid_layout.setContentsMargins(0, 0, 0, 0)
         mid_layout.setSpacing(0)
 
+        # 侧边栏
         self.sidebar = Sidebar()
         self.sidebar.nav_changed.connect(self._on_nav)
         mid_layout.addWidget(self.sidebar)
 
-        # 中央：预览（上） + stack（下）
-        center = self._build_center()
-        mid_layout.addWidget(center, 1)
+        # 右侧
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(16, 16, 16, 16)
+        right_layout.setSpacing(16)
 
-        # 右侧：数据统计常驻
-        self.data_stats = DataStatsPage()
-        self.data_stats.setMinimumWidth(340)
-        self.data_stats.setMaximumWidth(420)
-        mid_layout.addWidget(self.data_stats)
+        self.stack = QStackedWidget()
 
-        root.addWidget(mid, 1)
-
-        # 底部状态栏
-        root.addWidget(self._create_bottom_bar())
-
-        # 帧检测结果 → 数据统计
-        self.camera_view.detection_result.connect(self.data_stats.on_detection)
-        self.offline_test.detection_result.connect(self.data_stats.on_detection)
-
-        # 把 backends 注入设备管理页（它来负责扫描+连接）
-        self.device_manager.set_backends(self._cam_backends)
-        self.device_manager.camera_connected.connect(self._on_device_connected)
-        self.device_manager.camera_disconnected.connect(self._on_device_disconnected)
-
-        # 启动后尝试按 QSettings 自动连接
-        QTimer.singleShot(500, self._try_auto_reconnect)
-
-    # ==================== 中央区域 ====================
-    def _build_center(self) -> QWidget:
-        container = QWidget()
-        box = QVBoxLayout(container)
-        box.setContentsMargins(16, 16, 16, 16)
-        box.setSpacing(12)
-
-        # QSplitter：上=预览，下=功能页 stack
-        splitter = QSplitter(Qt.Vertical)
-        splitter.setHandleWidth(8)
-        splitter.setStyleSheet("""
-            QSplitter::handle {
-                background-color: #0f172a;
-                border: 1px solid #1e293b;
-            }
-            QSplitter::handle:hover { background-color: #1e293b; }
-        """)
+        # 页面 0：实时预览 = camera_view + control_panel 横向并排
+        self.preview_page = QWidget()
+        preview_layout = QHBoxLayout(self.preview_page)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_layout.setSpacing(16)
 
         self.camera_view = CameraView()
         self.camera_view.set_camera(self.cam)
         self.camera_view.set_engine(self.vision_engine)
-        splitter.addWidget(self.camera_view)
+        preview_layout.addWidget(self.camera_view, 1)
 
-        # 功能页 stack
-        self.stack = QStackedWidget()
-        self.param_page = ParamSettingsPage()
-        self.param_page.set_engine(self.vision_engine)
-        self.stack.addWidget(self.param_page)          # 0 param
+        self.control_panel = ControlPanel()
+        self.control_panel.set_engine(self.vision_engine)
+        preview_layout.addWidget(self.control_panel)
 
-        self.device_manager = DeviceManagerPage()
-        self.stack.addWidget(self.device_manager)      # 1 device
+        self.camera_view.detection_result.connect(self.control_panel.on_detection)
+        self.stack.addWidget(self.preview_page)
 
-        self.advanced_stats = AdvancedStatsPage()
-        self.stack.addWidget(self.advanced_stats)      # 2 stats
+        # 页面 1：相机调试
+        self.debug_page = CameraDebugPanel()
+        self.debug_page.set_camera(self.cam)
+        self.stack.addWidget(self.debug_page)
 
-        self.offline_test = OfflineTestPage()
-        self.offline_test.set_engine(self.vision_engine)
-        self.stack.addWidget(self.offline_test)        # 3 offline
+        # 页面 2：占位
+        self.placeholder_page = QWidget()
+        ph_layout = QVBoxLayout(self.placeholder_page)
+        ph_layout.setAlignment(Qt.AlignCenter)
+        ph_icon = QLabel("🔧")
+        ph_icon.setStyleSheet("font-size: 64px; color: #334155;")
+        ph_layout.addWidget(ph_icon, alignment=Qt.AlignCenter)
+        ph_text = QLabel("功能开发中...")
+        ph_text.setStyleSheet("font-size: 18px; color: #64748b; margin-top: 16px;")
+        ph_layout.addWidget(ph_text, alignment=Qt.AlignCenter)
+        self.stack.addWidget(self.placeholder_page)
 
-        self.image_viewer = ImageViewerPage()
-        self.stack.addWidget(self.image_viewer)        # 4 viewer
+        right_layout.addWidget(self.stack, 1)
+        right_layout.addWidget(self._create_bottom_bar())
 
-        self.system_settings = SystemSettingsPage()
-        self.stack.addWidget(self.system_settings)     # 5 system
+        mid_layout.addWidget(right, 1)
+        main_layout.addWidget(mid, 1)
 
-        splitter.addWidget(self.stack)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        splitter.setSizes([600, 400])
-        box.addWidget(splitter, 1)
-
-        return container
+        # 启动后尝试自动连接相机
+        QTimer.singleShot(500, self._auto_connect_camera)
 
     # ==================== 顶部栏 ====================
     def _create_top_bar(self) -> QWidget:
@@ -249,17 +228,6 @@ class MainWindow(QMainWindow):
         self.sys_status.setObjectName("TopBarStatus")
         layout.addWidget(self.sys_status)
 
-        btn_min = QPushButton("—")
-        btn_min.setFixedSize(32, 32)
-        btn_min.setStyleSheet("background: transparent; color: #94a3b8; font-size: 14px;")
-        btn_min.clicked.connect(self.showMinimized)
-        layout.addWidget(btn_min)
-
-        btn_close = QPushButton("✕")
-        btn_close.setFixedSize(32, 32)
-        btn_close.setStyleSheet("background: transparent; color: #94a3b8; font-size: 14px;")
-        btn_close.clicked.connect(self.close)
-        layout.addWidget(btn_close)
         return bar
 
     # ==================== 底部栏 ====================
@@ -271,6 +239,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(16, 10, 16, 10)
         layout.setSpacing(16)
 
+        # 左：连接状态
         left = QWidget()
         left.setStyleSheet("background-color: #0f172a; border-radius: 8px; border: 1px solid #1e293b;")
         ll = QVBoxLayout(left)
@@ -291,6 +260,7 @@ class MainWindow(QMainWindow):
         ll.addLayout(lights)
         layout.addWidget(left, 0)
 
+        # 右：日志
         right = QWidget()
         right.setStyleSheet("background-color: #0f172a; border-radius: 8px; border: 1px solid #1e293b;")
         rl = QVBoxLayout(right)
@@ -304,20 +274,35 @@ class MainWindow(QMainWindow):
         layout.addWidget(right, 1)
         return bar
 
-    # ==================== 侧边栏切换 ====================
-    def _on_nav(self, key: str):
-        page_map = {"param": 0, "device": 1, "stats": 2, "offline": 3, "viewer": 4, "system": 5}
-        if key in page_map:
-            self.stack.setCurrentIndex(page_map[key])
-            self.log_panel.append_log("导航", f"切换到：{self.sidebar._buttons[key].text()}", "info")
+    # ==================== 自动连接 ====================
+    def _auto_connect_camera(self):
+        """启动后按顺序枚举：大恒 → 海康，第一个发现的就连接"""
+        for name, backend in self._cam_backends.items():
+            devices = backend.enum_devices()
+            if not devices:
+                continue
+            label = {"daheng": "大恒", "hik": "海康"}.get(name, name)
+            self.log_panel.append_log(
+                "系统", f"发现 {len(devices)} 台{label}相机，尝试自动连接...", "info"
+            )
+            if backend.connect_device(0):
+                self._switch_active_backend(backend)
+                self.light_camera.set_connected(True)
+                backend.start_grabbing()
+                self.sys_status.setText("🔵 检测运行中")
+                self.sys_status.setStyleSheet(
+                    "color: #00d4ff; font-size: 11px; padding: 2px 10px; "
+                    "background-color: #0f172a; border-radius: 4px;"
+                )
+                return
+        self.log_panel.append_log("相机", "未检测到相机，请连接设备后重启或使用相机调试页", "warning")
 
-    # ==================== 相机事件 ====================
     def _switch_active_backend(self, backend):
         if self.cam is backend:
             return
         self.cam = backend
         self.camera_view.set_camera(backend)
-        self.device_manager.set_active_backend(backend)
+        self.debug_page.set_camera(backend)
 
     def _on_camera_log(self, tag, msg, level):
         self.log_panel.append_log(tag, msg, level or "info")
@@ -325,62 +310,36 @@ class MainWindow(QMainWindow):
     def _on_camera_connected(self, connected):
         self.light_camera.set_connected(connected)
 
-    def _on_device_connected(self, backend):
-        """DeviceManagerPage 发信号过来"""
-        self._switch_active_backend(backend)
-        self.light_camera.set_connected(True)
-        self.sys_status.setText("🔵 相机已连接")
-        self.sys_status.setStyleSheet(
-            "color: #00d4ff; font-size: 11px; padding: 2px 10px; "
-            "background-color: #0f172a; border-radius: 4px;"
-        )
+    # ==================== 侧边栏切换 ====================
+    def _on_nav(self, key: str):
+        page_names = {
+            "camera_preview": "实时预览",
+            "camera_debug": "相机调试",
+            "camera": "相机采集",
+            "process": "图像处理",
+            "detect": "缺陷检测",
+            "measure": "尺寸测量",
+            "record": "数据记录",
+            "settings": "系统设置",
+        }
+        name = page_names.get(key, key)
+        self.log_panel.append_log("导航", f"切换到页面: {name}", "info")
 
-    def _on_device_disconnected(self, backend):
-        self.light_camera.set_connected(False)
-        self.sys_status.setText("🟢 系统就绪")
-        self.sys_status.setStyleSheet("")
-
-    # ==================== 自动连接 ====================
-    def _try_auto_reconnect(self):
-        """启动后按 QSettings 里记住的相机做自动连接"""
-        auto = self._settings.value("camera/auto_reconnect", True, type=bool)
-        serial = self._settings.value("camera/last_serial", "", type=str)
-        backend_name = self._settings.value("camera/last_backend", "", type=str)
-
-        if not auto or not serial or backend_name not in self._cam_backends:
-            # 没开自动连接 / 首次启动 / 无效记录 → 不自动连，提示用户去设备管理扫描
-            self.log_panel.append_log(
-                "系统", "请在「设备管理」中扫描并连接相机", "info"
-            )
-            return
-
-        backend = self._cam_backends[backend_name]
-        label = {"daheng": "大恒", "hik": "海康"}.get(backend_name, backend_name)
-        self.log_panel.append_log(
-            "系统", f"尝试自动连接上次的{label}相机 (SN={serial})", "info"
-        )
-        if backend.connect_by_serial(serial):
-            backend.start_grabbing()
-            self._switch_active_backend(backend)
-            self.light_camera.set_connected(True)
-            self.sys_status.setText("🔵 相机已连接")
-            self.sys_status.setStyleSheet(
-                "color: #00d4ff; font-size: 11px; padding: 2px 10px; "
-                "background-color: #0f172a; border-radius: 4px;"
-            )
-        else:
-            self.log_panel.append_log(
-                "系统", "自动连接失败，请在「设备管理」中手动扫描", "warning"
-            )
+        if key == "camera_preview":
+            self.stack.setCurrentIndex(0)
+        elif key == "camera_debug":
+            self.stack.setCurrentIndex(1)
+            self.debug_page.refresh_params()
+        elif key in ("process", "detect", "measure", "record", "settings"):
+            self.stack.setCurrentIndex(2)
 
     # ==================== 顶部按钮 ====================
     def _on_start(self):
         if not self.cam.is_connected():
-            self.log_panel.append_log("运行", "相机未连接，请先在「设备管理」中连接相机", "warning")
+            self.log_panel.append_log("运行", "相机未连接", "warning")
             return
         if not self.cam.is_grabbing():
             self.cam.start_grabbing()
-        self.data_stats.set_recording(True)
         self.sys_status.setText("🔵 检测运行中")
         self.sys_status.setStyleSheet(
             "color: #00d4ff; font-size: 11px; padding: 2px 10px; "
@@ -389,14 +348,14 @@ class MainWindow(QMainWindow):
         self.log_panel.append_log("运行", "检测流程已启动", "success")
 
     def _on_stop(self):
-        # 不停相机（保持预览），只停记录（不再累计统计）
-        self.data_stats.set_recording(False)
+        if self.cam.is_grabbing():
+            self.cam.stop_grabbing()
         self.sys_status.setText("🟢 系统就绪")
         self.sys_status.setStyleSheet("")
-        self.log_panel.append_log("运行", "检测流程已停止（预览继续）", "warning")
+        self.log_panel.append_log("运行", "检测流程已停止", "warning")
 
     def _on_reset(self):
-        self.data_stats.reset_count()
+        self.control_panel.reset_count()
         self.log_panel.append_log("操作", "计数器已重置", "warning")
 
     # ==================== 退出 ====================
